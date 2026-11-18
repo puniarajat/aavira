@@ -681,10 +681,73 @@ function isTrainDay(p,dk){return TRAIN_DAYS[p.days].includes(parseKey(dk).getDay
 /* ===================== STATE ===================== */
 const KEY='spotter_v1';
 function load(){try{const r=localStorage.getItem(KEY);if(r)return JSON.parse(r);}catch(e){}return {profiles:[],active:null};}
-function save(){try{localStorage.setItem(KEY,JSON.stringify(DB));}catch(e){}}
+function save(){DB._ts=Date.now();try{localStorage.setItem(KEY,JSON.stringify(DB));}catch(e){}cloudQueue();}
+/* ===================== ACCOUNT (username + password via Firebase) ===================== */
+const FB={key:'AIzaSyCi3rIn1oqSL4L4mesjYIu7y4d61hcteNU',proj:'aavira-af71a'};
+const AKEY='aavira_auth';
+const AUTH={get(){try{return JSON.parse(localStorage.getItem(AKEY)||'null');}catch(e){return null;}},set(a){try{if(a)localStorage.setItem(AKEY,JSON.stringify(a));else localStorage.removeItem(AKEY);}catch(e){}}};
+function normUser(u){return String(u||'').trim().toLowerCase();}
+function uEmail(u){return normUser(u)+'@users.aavira.app';}
+function authErr(m){m=String(m||'');
+ if(/EMAIL_EXISTS/.test(m))return 'That username is taken. Pick another one.';
+ if(/INVALID_LOGIN_CREDENTIALS|INVALID_PASSWORD|EMAIL_NOT_FOUND/.test(m))return 'Wrong username or password.';
+ if(/WEAK_PASSWORD/.test(m))return 'Password must be at least 6 characters.';
+ if(/TOO_MANY_ATTEMPTS/.test(m))return 'Too many tries. Wait a few minutes and try again.';
+ if(/USER_DISABLED/.test(m))return 'This account has been turned off.';
+ if(/Failed to fetch|NetworkError|network/i.test(m))return 'No internet. Connect and try again.';
+ return 'Something went wrong ('+m+'). Try again.';}
+async function idpCall(path,body){const r=await fetch('https://identitytoolkit.googleapis.com/v1/accounts:'+path+'?key='+FB.key,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();if(!r.ok)throw new Error((j.error&&j.error.message)||'ERROR');return j;}
+function keepSession(j,username){const a={uid:j.localId,username,idToken:j.idToken,refreshToken:j.refreshToken,exp:Date.now()+(Number(j.expiresIn)||3600)*1000-60000};AUTH.set(a);return a;}
+async function idToken(){const a=AUTH.get();if(!a)return null;if(Date.now()<a.exp)return a.idToken;
+ const r=await fetch('https://securetoken.googleapis.com/v1/token?key='+FB.key,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'grant_type=refresh_token&refresh_token='+encodeURIComponent(a.refreshToken)});
+ const j=await r.json();if(!r.ok){if(/TOKEN_EXPIRED|USER_DISABLED|USER_NOT_FOUND|INVALID_REFRESH_TOKEN/.test((j.error&&j.error.message)||''))signOutNow(false);return null;}
+ a.idToken=j.id_token;a.refreshToken=j.refresh_token;a.exp=Date.now()+(Number(j.expires_in)||3600)*1000-60000;AUTH.set(a);return a.idToken;}
+const FSURL='https://firestore.googleapis.com/v1/projects/'+FB.proj+'/databases/(default)/documents/';
+async function fsReq(path,opt){const t=await idToken();if(!t)throw new Error('NO_TOKEN');const r=await fetch(FSURL+path,Object.assign({},opt||{},{headers:{'Content-Type':'application/json','Authorization':'Bearer '+t}}));if(r.status===404)return null;const j=await r.json();if(!r.ok)throw new Error((j.error&&j.error.message)||'FS_ERROR');return j;}
+async function cloudPull(){const a=AUTH.get();const d=await fsReq('users/'+a.uid+'/private/data');if(!d||!d.fields||!d.fields.json)return null;return JSON.parse(d.fields.json.stringValue);}
+async function cloudSeen(created){const a=AUTH.get();if(!a)return;const f={username:{stringValue:a.username},lastSeen:{timestampValue:new Date().toISOString()}};if(created)f.created={timestampValue:new Date().toISOString()};
+ const mask=Object.keys(f).map(k=>'updateMask.fieldPaths='+k).join('&');try{await fsReq('users/'+a.uid+'?'+mask,{method:'PATCH',body:JSON.stringify({fields:f})});}catch(e){}}
+let cloudTimer=null,cloudBusy=false,cloudReady=false;
+function cloudQueue(){if(!AUTH.get())return;clearTimeout(cloudTimer);cloudTimer=setTimeout(cloudPush,4000);}
+async function cloudPush(){const a=AUTH.get();if(!a||!cloudReady)return;if(cloudBusy){cloudQueue();return;}cloudBusy=true;
+ try{let json=JSON.stringify(DB);if(json.length>900000)json=JSON.stringify(DB,(k,v)=>k==='photo'?undefined:v);
+  await fsReq('users/'+a.uid+'/private/data',{method:'PATCH',body:JSON.stringify({fields:{json:{stringValue:json},updated:{integerValue:String(Date.now())}}})});
+ }catch(e){}finally{cloudBusy=false;}}
+function prepDB(){DB.profiles.forEach(p=>{p.equipment=(p.equipment||[]).filter(id=>EQ[id]);try{migrate(p);}catch(e){}try{backfill(p);}catch(e){}});}
+async function bootCloud(){if(!AUTH.get()){cloudReady=true;return;}
+ try{const c=await cloudPull();if(c&&c.profiles&&(c._ts||0)>BOOT_TS){clearTimeout(cloudTimer);DB=c;prepDB();try{localStorage.setItem(KEY,JSON.stringify(DB));}catch(e){}
+  if(ui.mode!=='auth'){ui.mode=DB.profiles.length?'app':'wizard';if(ui.mode==='wizard'){ui.step=0;ui.draft=newDraft();}if(!sheetOpen)render();}}}catch(e){}
+ cloudReady=true;cloudQueue();cloudSeen(false);}
+async function authGo(){const a=ui.auth,su=a.tab==='signup',user=normUser($('#au-user').value),pass=$('#au-pass').value;a.user=user;
+ if(!/^[a-z0-9._]{3,20}$/.test(user)){a.err='Username must be 3–20 letters, numbers, dots or underscores (no spaces).';render();return;}
+ if(pass.length<6){a.err='Password must be at least 6 characters.';render();return;}
+ if(su&&pass!==$('#au-pass2').value){a.err='The two passwords don’t match.';render();return;}
+ a.busy=true;a.err='';render();
+ try{const j=await idpCall(su?'signUp':'signInWithPassword',{email:uEmail(user),password:pass,returnSecureToken:true});keepSession(j,user);
+  let c=null;try{c=await cloudPull();}catch(e){}
+  if(c&&Array.isArray(c.profiles)){DB=c;prepDB();}
+  cloudReady=true;a.busy=false;
+  ui.mode=DB.profiles.length?'app':'wizard';ui.tab='today';if(ui.mode==='wizard'){ui.step=0;ui.draft=newDraft();}
+  save();cloudPush();cloudSeen(su);render();window.scrollTo(0,0);if(ui.mode==='app')setTimeout(()=>syncAll(),500);
+ }catch(e){a.busy=false;a.err=authErr(e.message);render();}}
+async function signOutNow(ask){if(ask&&!confirm('Sign out of AAVIRA on this phone? Your data stays saved in your account.'))return;
+ if(ask){clearTimeout(cloudTimer);try{await cloudPush();}catch(e){}}
+ AUTH.set(null);DB={profiles:[],active:null};try{localStorage.setItem(KEY,JSON.stringify(DB));}catch(e){}
+ if(typeof sheetOpen!=='undefined'&&sheetOpen)closeSheet(true);ui.mode='auth';ui.auth={tab:'login',err:'',busy:false,user:''};render();window.scrollTo(0,0);}
+function renderAuth(){const a=ui.auth,su=a.tab==='signup';
+ return `<section class="section" style="padding-top:28px"><div class="brand" style="margin-bottom:14px">${IC.plate}AAVIRA</div>
+ <h1>${su?'Create your account':'Welcome back'}</h1><p class="muted">${su?'Pick a username and password. Your workouts, diet and progress are saved to your account, so you can sign in on any phone.':'Sign in with your username and password.'}</p>
+ <div class="field">${`<div class="seg" role="group"><button class="${su?'':'on'}" data-act="auth-tab" data-v="login" aria-pressed="${!su}">Sign in</button><button class="${su?'on':''}" data-act="auth-tab" data-v="signup" aria-pressed="${su}">Sign up</button></div>`}</div>
+ <div class="field"><label for="au-user">Username</label><input id="au-user" class="input" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" value="${esc(a.user||'')}"></div>
+ <div class="field"><label for="au-pass">Password</label><input id="au-pass" class="input" type="password" autocomplete="${su?'new-password':'current-password'}"></div>
+ ${su?`<div class="field"><label for="au-pass2">Confirm password</label><input id="au-pass2" class="input" type="password" autocomplete="new-password"></div><p class="small muted">Username: 3–20 letters, numbers, dots or underscores. Password: at least 6 characters. There’s no email, so keep your password safe.</p>`:''}
+ ${a.err?`<p class="err">${esc(a.err)}</p>`:''}
+ <button class="btn block" style="margin-top:14px" data-act="auth-go" ${a.busy?'disabled':''}>${a.busy?'Please wait…':su?'Create account':'Sign in'}</button></section>`;}
+
 try{if(window.AavBridge){const pend=AavBridge.pendingData();if(pend){if(!localStorage.getItem(KEY))localStorage.setItem(KEY,pend);AavBridge.clearPending();}}}catch(e){}
 let DB=load();
-const ui={tab:'today',mode:DB.profiles.length?'app':'wizard',step:0,draft:null,editing:null,planDay:null,gearQ:'',gearMine:true,err:''};
+const BOOT_TS=DB._ts||0;
+const ui={auth:{tab:'signup',err:'',busy:false,user:''},tab:'today',mode:!AUTH.get()?'auth':DB.profiles.length?'app':'wizard',step:0,draft:null,editing:null,planDay:null,gearQ:'',gearMine:true,err:''};
 if(ui.mode==='wizard') ui.draft=newDraft();
 DB.profiles.forEach(p=>{p.equipment=(p.equipment||[]).filter(id=>EQ[id]);});save();
 function P(){return DB.profiles.find(p=>p.id===DB.active)||DB.profiles[0];}
@@ -1088,6 +1151,7 @@ function manualBox(){return `<section class="section"><details class="panel"><su
 /* ===================== RENDER ===================== */
 function render(){
  const app=$('#app');
+ if(ui.mode==='auth'){app.innerHTML=renderAuth();$('.nav')?.remove();return;}
  if(ui.mode==='wizard'){app.innerHTML=renderWizard();$('.nav')?.remove();return;}
  const p=P();
  app.innerHTML=topbar(p)+({today:renderToday,plan:renderPlan,diet:renderDiet,gear:renderGear,race:renderRace,me:renderMe}[ui.tab]||renderToday)(p);
@@ -1203,7 +1267,8 @@ function renderMe(p){
  <section class="section"><button class="btn block ghost" data-act="edit">Edit my details</button></section>
  <section class="section"><h2>My gym’s equipment</h2><p class="muted small">Tick everything your gym has. Your plan updates instantly.</p>${eqChecklist(p.equipment,'eq-toggle')}</section>
  <section class="section"><button class="btn block ghost" data-act="add-person">Add another person</button></section>
- <section class="section"><button class="btn block danger" data-act="restart">Restart this month from today</button><p class="small muted" style="margin-top:8px">Everything is saved on this phone only. Nothing is sent anywhere.</p></section>
+ <section class="section"><button class="btn block danger" data-act="restart">Restart this month from today</button></section>
+ <section class="section panel small"><p style="margin:0 0 10px">Signed in as <b>${esc((AUTH.get()||{}).username||'')}</b>. Your data is backed up to your account automatically.</p><button class="btn block ghost" data-act="logout">Sign out</button></section>
  <section class="section"><button class="btn block danger" data-act="delete">Delete ${esc(p.name.split(' ')[0])}’s profile</button></section>`;
 }
 
@@ -1310,6 +1375,9 @@ const ACT={
   if(g.kind!=='test'&&canCrypto()){try{const c=normCode(g.code);fetch(RELAY+await topicOf(g.code),{method:'POST',body:await seal(c,{v:2,id:p.id,left:true,ts:Date.now()})}).catch(()=>{});}catch(e){}}
   p.groups=groupsOf(p).filter(x=>x.code!==g.code);ui.gid=null;save();render();window.scrollTo(0,0);},
  sync:()=>syncAll(true),
+ 'auth-tab':t=>{ui.auth.tab=t.dataset.v;ui.auth.err='';const u=$('#au-user');if(u)ui.auth.user=u.value;render();},
+ 'auth-go':()=>authGo(),
+ logout:()=>signOutNow(true),
  'ms-type':t=>{ui.msDraft.type=t.dataset.v;ui.msDraft.target=MS_TYPES[t.dataset.v].def||0;ui.msErr='';render();},
  'ms-target':t=>{ui.msDraft.target=Number(t.dataset.v);render();},
  'ms-new':()=>{ui.msForm=true;ui.msDraft=null;ui.msErr='';render();window.scrollTo(0,0);},
@@ -1367,10 +1435,11 @@ document.addEventListener('input',e=>{if(e.target.id==='pk-q'){ui.pick.q=e.targe
 window.addEventListener('popstate',e=>{if(sheetOpen){closeSheet(true);return;}if(ui.mode==='wizard'&&ui.step>0){ui.step--;render();return;}if(ui.mode==='app'&&ui.tab==='race'&&ui.gid&&!(e.state&&e.state.gid)){ui.gid=null;ui.msForm=false;render();return;}ui.tab=(e.state&&e.state.tab)||'today';ui.gid=e.state&&e.state.gid||null;render();});
 if(IS_APP){try{history.replaceState({tab:'today'},'');}catch(e){}}
 document.addEventListener('change',e=>{if(e.target&&e.target.id==='photo-in'&&e.target.files&&e.target.files[0])handlePhoto(e.target.files[0]);});
-document.addEventListener('keydown',e=>{if(e.key==='Escape')closeSheet();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeSheet();if(e.key==='Enter'&&ui.mode==='auth'&&e.target.id&&e.target.id.startsWith('au-')){e.preventDefault();authGo();}});
 DB.profiles.forEach(p=>{try{migrate(p);}catch(e){}if(p.groups)p.groups=p.groups.filter(g=>g.kind!=='test');try{backfill(p);}catch(e){}});save();
 render();
 if('serviceWorker' in navigator&&/github\.io$/.test(location.hostname)){navigator.serviceWorker.register('sw.js').catch(()=>{});}
+bootCloud();
 setTimeout(()=>{if(ui.mode==='app')syncAll();},800);
 let lastBg=Date.now();
 setInterval(()=>{if(ui.mode!=='app'||document.visibilityState==='hidden')return;if(ui.tab==='race'||Date.now()-lastBg>600000){lastBg=Date.now();syncAll();}},90000);
